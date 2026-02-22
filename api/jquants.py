@@ -1,21 +1,10 @@
 """
-J-Quants API V2 呼び出しモジュール
-====================================
-2025年12月リリースの V2 API に対応。
-認証方式: x-api-key ヘッダー（APIキー方式）
+J-Quants API 呼び出しモジュール（V2 + V1フォールバック）
+==========================================================
+認証方式: x-api-key ヘッダー（V2 APIキー方式）
 
-V1（メール/パスワード→トークン方式）は廃止予定のため、
-V2 API キー方式のみをサポートする。
-
-J-Quants ダッシュボードからAPIキーを取得してください。
-https://jpx-jquants.com/dashboard/api-keys
-
-V2主要エンドポイント（Freeプランで利用可能）:
-  - GET /v2/equities/list        銘柄一覧（業種・時価総額等）
-  - GET /v2/equities/bars/daily  株価四本値（日次）
-  - GET /v2/fins/summary         財務サマリー（PER・PBR等）
-
-レスポンス形式: { "data": [...], "pagination_key": "..." }
+銘柄一覧は V2 → V1 の順でフォールバックを試みる。
+エラーは必ず呼び出し元まで raise し、サイレントに握り潰さない。
 """
 
 import logging
@@ -27,117 +16,219 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# ── エンドポイント定数 ─────────────────────────────
-BASE_URL_V2 = "https://api.jquants.com/v2"
-ENDPOINT_LIST       = f"{BASE_URL_V2}/equities/list"        # 銘柄一覧
-ENDPOINT_BARS_DAILY = f"{BASE_URL_V2}/equities/bars/daily"  # 株価日次
-ENDPOINT_FIN_SUMMARY = f"{BASE_URL_V2}/fins/summary"        # 財務サマリー
+# ── エンドポイント ─────────────────────────────────────────
+BASE_V1 = "https://api.jquants.com/v1"
+BASE_V2 = "https://api.jquants.com/v2"
 
-# APIリクエスト間のスリープ（レートリミット対策）
-REQUEST_INTERVAL = 0.2
-# リトライ待機（秒 × attempt番号）
-RETRY_WAIT_SEC = 1.0
+# 銘柄一覧: /v2/equities/master（dateパラメータ必須）
+# 注意: /v2/equities/list は存在しない（403 "endpoint does not exist"）
+ENDPOINT_LIST_V2     = f"{BASE_V2}/equities/master"     # V2 正しいエンドポイント
+ENDPOINT_LIST_V1     = f"{BASE_V1}/listed/info"         # V1 フォールバック
+
+# 株価・財務
+ENDPOINT_BARS_DAILY  = f"{BASE_V2}/equities/bars/daily" # V2
+ENDPOINT_FIN_SUMMARY = f"{BASE_V2}/fins/summary"        # V2
+
+REQUEST_INTERVAL = 0.2   # リクエスト間スリープ（レートリミット対策）
+RETRY_WAIT_SEC   = 1.0   # リトライ待機基礎秒数
 
 
-def _make_headers(api_key: str) -> dict[str, str]:
-    """
-    V2 API 認証ヘッダーを生成する。
+# ─────────────────────────────────────────────────────────
+# ヘルパー
+# ─────────────────────────────────────────────────────────
 
-    Args:
-        api_key: J-Quants ダッシュボードで発行したAPIキー
-
-    Returns:
-        x-api-key ヘッダーを含む辞書
-    """
+def _headers(api_key: str) -> dict:
+    """V2 APIキー認証ヘッダーを返す。"""
     return {"x-api-key": api_key}
 
 
-def validate_api_key(api_key: str) -> bool:
+def _get_with_retry(
+    url: str,
+    headers: dict,
+    params: dict,
+    retries: int = 3,
+    timeout: int = 30,
+) -> requests.Response:
     """
-    APIキーの有効性を /equities/list への試験リクエストで確認する。
-
-    Args:
-        api_key: 確認対象のAPIキー
-
-    Returns:
-        True: 有効なAPIキー / False: 無効（認証失敗）
-
-    Raises:
-        requests.exceptions.ConnectionError: ネットワーク接続エラー時
+    GETリクエストをリトライ付きで実行する。
+    成功(200)のレスポンスを返す。失敗時は RuntimeError を raise する。
+    RuntimeError のメッセージには HTTPステータスと APIレスポンス本文を含める。
     """
-    headers = _make_headers(api_key)
-    resp = requests.get(
-        ENDPOINT_LIST,
-        headers=headers,
-        params={"date": "20240101"},  # 固定日付で試験
-        timeout=15,
+    last_error: str = ""
+
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+
+            if resp.status_code == 200:
+                return resp
+
+            # --- エラー応答の詳細をメッセージに含める ---
+            body_preview = resp.text[:400]
+            last_error = (
+                f"HTTP {resp.status_code} — URL: {url}\n"
+                f"レスポンス本文: {body_preview}"
+            )
+
+            # 認証エラーはリトライ不要
+            if resp.status_code in (401, 403):
+                raise RuntimeError(
+                    f"認証エラー (HTTP {resp.status_code})\n"
+                    f"APIキーが正しいか、プランが登録済みか確認してください。\n"
+                    f"詳細: {body_preview}"
+                )
+
+            # 404 = エンドポイントが存在しない
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    f"エンドポイントが見つかりません (HTTP 404) — {url}\n"
+                    f"詳細: {body_preview}"
+                )
+
+        except RuntimeError:
+            raise  # 上位へ伝播
+
+        except requests.exceptions.ConnectionError as e:
+            last_error = f"接続エラー: {e}"
+        except requests.exceptions.Timeout:
+            last_error = f"タイムアウト ({timeout}秒): {url}"
+        except requests.exceptions.RequestException as e:
+            last_error = f"リクエストエラー: {e}"
+
+        if attempt < retries - 1:
+            wait = RETRY_WAIT_SEC * (attempt + 1)
+            logger.warning(f"リトライ {attempt+1}/{retries}（{wait}秒後）: {last_error}")
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"最大リトライ回数 ({retries}) 超過\n"
+        f"最後のエラー: {last_error}"
     )
-    # 401/403 = 認証失敗、200 = 成功
-    return resp.status_code == 200
 
 
-# ─────────────────────────────────────────────────────────
-# 銘柄情報取得
-# ─────────────────────────────────────────────────────────
-
-def get_listed_info(api_key: str, retries: int = 3) -> pd.DataFrame:
+def _fetch_all_pages(
+    url: str,
+    api_key: str,
+    data_key_candidates: list[str],
+    extra_params: Optional[dict] = None,
+) -> pd.DataFrame:
     """
-    上場銘柄一覧を取得する（V2: /equities/list）。
-    ページネーション対応（全ページを結合して返す）。
-
-    V2 主要カラム（略称 → 意味）:
-        Code          : 銘柄コード
-        CompanyName   : 銘柄名
-        Sector33Code  : 33業種コード
-        Sector33CodeName : 33業種名
-        MarketCode    : 市場区分コード
-        MarketCodeName : 市場区分名
-        Shares        : 上場株式数
-
-    Args:
-        api_key: J-Quants APIキー
-        retries: リトライ回数
-
-    Returns:
-        銘柄情報DataFrame（取得失敗時は空のDataFrame）
+    ページネーションを処理して全ページのデータを結合する。
+    data_key_candidates に指定したキーを順番に探してデータを取り出す。
     """
-    headers = _make_headers(api_key)
+    hdrs = _headers(api_key)
     all_rows: list[dict] = []
     pagination_key: Optional[str] = None
 
     while True:
-        params: dict[str, str] = {}
+        params: dict = dict(extra_params or {})
         if pagination_key:
             params["pagination_key"] = pagination_key
 
-        for attempt in range(retries):
-            try:
-                resp = requests.get(
-                    ENDPOINT_LIST,
-                    headers=headers,
-                    params=params,
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                rows = body.get("data", body.get("info", []))  # V2="data", V1互換="info"
-                all_rows.extend(rows)
-                pagination_key = body.get("pagination_key")
-                break
-            except requests.exceptions.RequestException as e:
-                if attempt < retries - 1:
-                    wait = RETRY_WAIT_SEC * (attempt + 1)
-                    logger.warning(f"銘柄一覧取得失敗 attempt {attempt+1}: {e}, {wait}秒後リトライ")
-                    time.sleep(wait)
-                else:
-                    logger.error(f"銘柄一覧取得を断念: {e}")
-                    return pd.DataFrame()
+        resp = _get_with_retry(url, hdrs, params)
+        body = resp.json()
 
+        rows: list = []
+        for key in data_key_candidates:
+            if key in body:
+                rows = body[key]
+                break
+        all_rows.extend(rows)
+
+        pagination_key = body.get("pagination_key")
         if not pagination_key:
             break
         time.sleep(REQUEST_INTERVAL)
 
     return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────
+# 銘柄一覧取得（V2 → V1 フォールバック付き）
+# ─────────────────────────────────────────────────────────
+
+def get_listed_info(api_key: str) -> tuple[pd.DataFrame, str]:
+    """
+    上場銘柄一覧を取得する。
+    V2(/v2/equities/master) を優先し、失敗した場合は V1(/v1/listed/info) にフォールバックする。
+
+    V2エンドポイント: /v2/equities/master
+      - dateパラメータが必須（省略するとエラー）
+      - 本日日付を渡して当日時点の全銘柄を取得する
+    V2主要カラム（V1と名称が異なる）:
+      Code     : 銘柄コード（5桁）
+      CoName   : 銘柄名（≒ V1の CompanyName）
+      CoNameEn : 銘柄名（英語）
+      S33      : 33業種コード
+      S33Nm    : 33業種名（≒ V1の Sector33CodeName）
+      S17      : 17業種コード
+      S17Nm    : 17業種名
+      Mkt      : 市場コード
+      MktNm    : 市場区分名（≒ V1の MarketCodeName）
+      ScaleCat : 規模区分（TOPIX Large70 / Mid400 / Small1 / Small2 / New Index）
+      ※ Shares（上場株式数）カラムは存在しないため時価総額の計算不可
+
+    Returns:
+        (DataFrame, 使用したエンドポイントを示す文字列 "v2" | "v1")
+
+    Raises:
+        RuntimeError: V2・V1 ともに失敗した場合。詳細なエラーメッセージを含む。
+    """
+    from datetime import date as _date
+    v2_error_msg: str = ""
+
+    # ── V2 を試す ──────────────────────────────────────
+    # /v2/equities/master は date パラメータが必須
+    today_str = _date.today().strftime("%Y%m%d")
+    try:
+        df = _fetch_all_pages(
+            url=ENDPOINT_LIST_V2,
+            api_key=api_key,
+            data_key_candidates=["data", "info"],
+            extra_params={"date": today_str},
+        )
+        if not df.empty:
+            logger.info(f"V2銘柄一覧取得成功: {len(df)}件 ({ENDPOINT_LIST_V2})")
+            return df, "v2"
+        # 200が返ったがデータが空 → V1を試す
+        v2_error_msg = "V2エンドポイントは200を返したがデータが空でした。"
+        logger.warning(v2_error_msg)
+
+    except RuntimeError as e:
+        v2_error_msg = str(e)
+        # 認証エラー(401/403)はフォールバック不要
+        if "HTTP 401" in v2_error_msg or "HTTP 403" in v2_error_msg:
+            raise RuntimeError(
+                f"認証エラー: APIキーが正しくないか、プランが未登録です。\n\n"
+                f"詳細:\n{v2_error_msg}"
+            )
+        logger.warning(f"V2失敗。V1にフォールバック。V2エラー: {v2_error_msg[:200]}")
+
+    # ── V1 フォールバック ─────────────────────────────
+    try:
+        df = _fetch_all_pages(
+            url=ENDPOINT_LIST_V1,
+            api_key=api_key,
+            data_key_candidates=["info", "data"],
+        )
+        if not df.empty:
+            logger.info(f"V1銘柄一覧取得成功: {len(df)}件 ({ENDPOINT_LIST_V1})")
+            return df, "v1"
+        v1_error_msg = "V1エンドポイントは200を返したがデータが空でした。"
+
+    except RuntimeError as e:
+        v1_error_msg = str(e)
+
+    # ── 両方失敗 ─────────────────────────────────────
+    raise RuntimeError(
+        f"銘柄一覧の取得に失敗しました（V2・V1ともにエラー）\n\n"
+        f"【V2エラー詳細】\n{v2_error_msg}\n\n"
+        f"【V1フォールバックエラー詳細】\n{v1_error_msg}\n\n"
+        f"確認事項:\n"
+        f"  1. APIキーをJ-Quantsダッシュボードで再確認・再発行してください\n"
+        f"  2. サブスクリプションプラン（Freeプラン含む）に登録済みか確認してください\n"
+        f"  3. インターネット接続が正常か確認してください"
+    )
 
 
 # ─────────────────────────────────────────────────────────
@@ -147,117 +238,43 @@ def get_listed_info(api_key: str, retries: int = 3) -> pd.DataFrame:
 def get_daily_quotes_by_date(
     api_key: str,
     date_str: str,
-    retries: int = 3,
 ) -> pd.DataFrame:
     """
-    指定日の全銘柄株価データを取得する（V2: /equities/bars/daily）。
-    ページネーション対応。
+    指定日の全銘柄株価データを取得する (V2: /equities/bars/daily)。
+    非営業日など正常に空の場合は空DataFrameを返す。
+    ネットワークエラーなど異常時もログを出して空DataFrameを返す（スクリーニング継続）。
 
-    V2 主要カラム（略称 → 意味）:
-        Code  : 銘柄コード
-        Date  : 日付
-        O     : 始値
-        H     : 高値
-        L     : 安値
-        C     : 終値
-        Vo    : 出来高
-        AdjO  : 修正後始値
-        AdjH  : 修正後高値
-        AdjL  : 修正後安値
-        AdjC  : 修正後終値（株式分割等を考慮）
-        AdjVo : 修正後出来高
-
-    Args:
-        api_key: J-Quants APIキー
-        date_str: 取得日付（YYYYMMDD形式 または YYYY-MM-DD形式）
-        retries: リトライ回数
-
-    Returns:
-        株価DataFrame（非営業日や取得失敗時は空のDataFrame）
+    V2カラム: Code, Date, O, H, L, C, Vo, AdjO, AdjH, AdjL, AdjC, AdjVo
     """
-    headers = _make_headers(api_key)
-    all_rows: list[dict] = []
-    pagination_key: Optional[str] = None
-
-    while True:
-        params: dict[str, str] = {"date": date_str}
-        if pagination_key:
-            params["pagination_key"] = pagination_key
-
-        for attempt in range(retries):
-            try:
-                resp = requests.get(
-                    ENDPOINT_BARS_DAILY,
-                    headers=headers,
-                    params=params,
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                # V2 = "data", V1互換 = "daily_quotes"
-                rows = body.get("data", body.get("daily_quotes", []))
-                all_rows.extend(rows)
-                pagination_key = body.get("pagination_key")
-                break
-            except requests.exceptions.RequestException as e:
-                if attempt < retries - 1:
-                    wait = RETRY_WAIT_SEC * (attempt + 1)
-                    logger.warning(
-                        f"株価 {date_str} 取得失敗 attempt {attempt+1}: {e}, {wait}秒後リトライ"
-                    )
-                    time.sleep(wait)
-                else:
-                    logger.error(f"株価 {date_str} の取得を断念: {e}")
-                    return pd.DataFrame()
-
-        if not pagination_key:
-            break
-        time.sleep(REQUEST_INTERVAL)
-
-    return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+    try:
+        return _fetch_all_pages(
+            url=ENDPOINT_BARS_DAILY,
+            api_key=api_key,
+            data_key_candidates=["data", "daily_quotes"],
+            extra_params={"date": date_str},
+        )
+    except RuntimeError as e:
+        # 非営業日=データなし(404 or 空) は正常。それ以外はログだけ出してスキップ
+        logger.warning(f"株価 {date_str} スキップ: {str(e)[:120]}")
+        return pd.DataFrame()
 
 
 # ─────────────────────────────────────────────────────────
 # 財務データ取得（PER・PBR）
 # ─────────────────────────────────────────────────────────
 
-def get_fins_summary(
-    api_key: str,
-    code: str,
-    retries: int = 3,
-) -> pd.DataFrame:
+def get_fins_summary(api_key: str, code: str) -> pd.DataFrame:
     """
-    財務サマリーデータを取得する（V2: /fins/summary）。
-    PER・PBRの算出に使用する。
-
-    Args:
-        api_key: J-Quants APIキー
-        code: 銘柄コード（4桁）
-        retries: リトライ回数
-
-    Returns:
-        財務サマリーDataFrame（取得失敗時は空のDataFrame）
+    財務サマリーを取得する (V2: /fins/summary)。
+    取得失敗時は空DataFrameを返す（PER/PBRをN/Aとして扱う）。
     """
-    headers = _make_headers(api_key)
-    params = {"code": code}
-
-    for attempt in range(retries):
-        try:
-            resp = requests.get(
-                ENDPOINT_FIN_SUMMARY,
-                headers=headers,
-                params=params,
-                timeout=30,
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            data = body.get("data", body.get("statements", []))
-            return pd.DataFrame(data) if data else pd.DataFrame()
-        except requests.exceptions.RequestException as e:
-            if attempt < retries - 1:
-                time.sleep(RETRY_WAIT_SEC * (attempt + 1))
-            else:
-                logger.warning(f"銘柄 {code} 財務サマリー取得失敗: {e}")
-                return pd.DataFrame()
-
-    return pd.DataFrame()
+    try:
+        return _fetch_all_pages(
+            url=ENDPOINT_FIN_SUMMARY,
+            api_key=api_key,
+            data_key_candidates=["data", "statements"],
+            extra_params={"code": code},
+        )
+    except RuntimeError as e:
+        logger.warning(f"銘柄 {code} 財務サマリー取得失敗: {str(e)[:120]}")
+        return pd.DataFrame()
