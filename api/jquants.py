@@ -1,9 +1,14 @@
 """
-J-Quants API 呼び出しモジュール（V2 + V1フォールバック）
-==========================================================
+J-Quants API 呼び出しモジュール（V2専用）
+==========================================
 認証方式: x-api-key ヘッダー（V2 APIキー方式）
 
-銘柄一覧は V2 → V1 の順でフォールバックを試みる。
+診断済み正常エンドポイント（2026-02時点）:
+  GET /v2/equities/master     銘柄一覧（dateパラメータ必須）
+  GET /v2/equities/bars/daily 株価四本値
+  GET /v2/fins/summary        財務サマリー
+
+V1（/v1/...）はAPIキー認証非対応のため使用しない。
 エラーは必ず呼び出し元まで raise し、サイレントに握り潰さない。
 """
 
@@ -17,17 +22,12 @@ import requests
 logger = logging.getLogger(__name__)
 
 # ── エンドポイント ─────────────────────────────────────────
-BASE_V1 = "https://api.jquants.com/v1"
 BASE_V2 = "https://api.jquants.com/v2"
 
-# 銘柄一覧: /v2/equities/master（dateパラメータ必須）
-# 注意: /v2/equities/list は存在しない（403 "endpoint does not exist"）
-ENDPOINT_LIST_V2     = f"{BASE_V2}/equities/master"     # V2 正しいエンドポイント
-ENDPOINT_LIST_V1     = f"{BASE_V1}/listed/info"         # V1 フォールバック
-
-# 株価・財務
-ENDPOINT_BARS_DAILY  = f"{BASE_V2}/equities/bars/daily" # V2
-ENDPOINT_FIN_SUMMARY = f"{BASE_V2}/fins/summary"        # V2
+# 確定済み正しいエンドポイント（診断済み 2026-02）
+ENDPOINT_LIST_V2     = f"{BASE_V2}/equities/master"     # 銘柄一覧（dateパラメータ必須）
+ENDPOINT_BARS_DAILY  = f"{BASE_V2}/equities/bars/daily" # 株価四本値
+ENDPOINT_FIN_SUMMARY = f"{BASE_V2}/fins/summary"        # 財務サマリー
 
 REQUEST_INTERVAL = 0.2   # リクエスト間スリープ（レートリミット対策）
 RETRY_WAIT_SEC   = 1.0   # リトライ待機基礎秒数
@@ -144,91 +144,54 @@ def _fetch_all_pages(
 
 
 # ─────────────────────────────────────────────────────────
-# 銘柄一覧取得（V2 → V1 フォールバック付き）
+# 銘柄一覧取得
 # ─────────────────────────────────────────────────────────
 
 def get_listed_info(api_key: str) -> tuple[pd.DataFrame, str]:
     """
-    上場銘柄一覧を取得する。
-    V2(/v2/equities/master) を優先し、失敗した場合は V1(/v1/listed/info) にフォールバックする。
+    上場銘柄一覧を取得する（V2: GET /v2/equities/master）。
 
-    V2エンドポイント: /v2/equities/master
-      - dateパラメータが必須（省略するとエラー）
-      - 本日日付を渡して当日時点の全銘柄を取得する
-    V2主要カラム（V1と名称が異なる）:
+    エンドポイント仕様:
+      URL  : https://api.jquants.com/v2/equities/master
+      認証 : x-api-key ヘッダー
+      必須 : date または code パラメータのいずれか
+             → 本関数では本日日付を自動付与して全銘柄を取得する
+
+    V2レスポンスカラム:
       Code     : 銘柄コード（5桁）
-      CoName   : 銘柄名（≒ V1の CompanyName）
+      CoName   : 銘柄名
       CoNameEn : 銘柄名（英語）
       S33      : 33業種コード
-      S33Nm    : 33業種名（≒ V1の Sector33CodeName）
+      S33Nm    : 33業種名
       S17      : 17業種コード
       S17Nm    : 17業種名
       Mkt      : 市場コード
-      MktNm    : 市場区分名（≒ V1の MarketCodeName）
-      ScaleCat : 規模区分（TOPIX Large70 / Mid400 / Small1 / Small2 / New Index）
-      ※ Shares（上場株式数）カラムは存在しないため時価総額の計算不可
+      MktNm    : 市場区分名
+      ScaleCat : 規模区分
+      ※ Shares（上場株式数）は含まれない → 時価総額の算出不可
 
     Returns:
-        (DataFrame, 使用したエンドポイントを示す文字列 "v2" | "v1")
+        (DataFrame, "v2")  ※常にV2を使用
 
     Raises:
-        RuntimeError: V2・V1 ともに失敗した場合。詳細なエラーメッセージを含む。
+        RuntimeError: 取得失敗時。HTTPステータスとレスポンス本文を含む。
     """
     from datetime import date as _date
-    v2_error_msg: str = ""
-
-    # ── V2 を試す ──────────────────────────────────────
-    # /v2/equities/master は date パラメータが必須
     today_str = _date.today().strftime("%Y%m%d")
-    try:
-        df = _fetch_all_pages(
-            url=ENDPOINT_LIST_V2,
-            api_key=api_key,
-            data_key_candidates=["data", "info"],
-            extra_params={"date": today_str},
-        )
-        if not df.empty:
-            logger.info(f"V2銘柄一覧取得成功: {len(df)}件 ({ENDPOINT_LIST_V2})")
-            return df, "v2"
-        # 200が返ったがデータが空 → V1を試す
-        v2_error_msg = "V2エンドポイントは200を返したがデータが空でした。"
-        logger.warning(v2_error_msg)
 
-    except RuntimeError as e:
-        v2_error_msg = str(e)
-        # 認証エラー(401/403)はフォールバック不要
-        if "HTTP 401" in v2_error_msg or "HTTP 403" in v2_error_msg:
-            raise RuntimeError(
-                f"認証エラー: APIキーが正しくないか、プランが未登録です。\n\n"
-                f"詳細:\n{v2_error_msg}"
-            )
-        logger.warning(f"V2失敗。V1にフォールバック。V2エラー: {v2_error_msg[:200]}")
-
-    # ── V1 フォールバック ─────────────────────────────
-    try:
-        df = _fetch_all_pages(
-            url=ENDPOINT_LIST_V1,
-            api_key=api_key,
-            data_key_candidates=["info", "data"],
-        )
-        if not df.empty:
-            logger.info(f"V1銘柄一覧取得成功: {len(df)}件 ({ENDPOINT_LIST_V1})")
-            return df, "v1"
-        v1_error_msg = "V1エンドポイントは200を返したがデータが空でした。"
-
-    except RuntimeError as e:
-        v1_error_msg = str(e)
-
-    # ── 両方失敗 ─────────────────────────────────────
-    raise RuntimeError(
-        f"銘柄一覧の取得に失敗しました（V2・V1ともにエラー）\n\n"
-        f"【V2エラー詳細】\n{v2_error_msg}\n\n"
-        f"【V1フォールバックエラー詳細】\n{v1_error_msg}\n\n"
-        f"確認事項:\n"
-        f"  1. APIキーをJ-Quantsダッシュボードで再確認・再発行してください\n"
-        f"  2. サブスクリプションプラン（Freeプラン含む）に登録済みか確認してください\n"
-        f"  3. インターネット接続が正常か確認してください"
+    df = _fetch_all_pages(
+        url=ENDPOINT_LIST_V2,
+        api_key=api_key,
+        data_key_candidates=["data"],
+        extra_params={"date": today_str},
     )
+    if df.empty:
+        raise RuntimeError(
+            "銘柄一覧が空でした（HTTP 200だがデータなし）。\n"
+            "しばらく待ってから再試行してください。"
+        )
+    logger.info(f"銘柄一覧取得成功: {len(df)}件")
+    return df, "v2"
 
 
 # ─────────────────────────────────────────────────────────
