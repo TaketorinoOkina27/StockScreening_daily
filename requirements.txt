@@ -5,4 +5,5 @@ requests>=2.31.0
 
 # 起動方法
 # python3 -m streamlit run app.py
-
+#　診断方法　
+# python3 -m streamlit run diagnose.py
