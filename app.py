@@ -1,5 +1,5 @@
 """
-連続上昇銘柄スクリーナー（J-Quants API V2対応版）
+連続上昇銘柄スクリーナー（J-Quants API V2対応）
 起動: streamlit run app.py
 """
 
@@ -28,12 +28,11 @@ st.set_page_config(
 
 # ── セッション状態 ─────────────────────────────────────────
 _DEFAULTS = {
-    "api_key": None,
-    "listed_info": None,
-    "api_version": None,       # "v2" or "v1"（接続成功時に記録）
+    "api_key":          None,
+    "listed_info":      None,
     "screening_result": None,
-    "last_run_params": {},
-    "connect_error": None,     # 接続時の詳細エラーメッセージ
+    "last_run_params":  {},
+    "connect_error":    None,
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
@@ -53,8 +52,7 @@ with st.sidebar:
 
     if is_logged_in():
         info_df: pd.DataFrame = st.session_state["listed_info"]
-        ver = st.session_state.get("api_version", "?")
-        st.success(f"✅ 接続済み（API {ver.upper()}）")
+        st.success("✅ 接続済み")
         st.caption(f"取得銘柄数: {len(info_df):,} 件")
         if st.button("切断", use_container_width=True):
             for k in _DEFAULTS:
@@ -80,17 +78,16 @@ with st.sidebar:
             if not api_key_input or not api_key_input.strip():
                 st.error("APIキーを入力してください。")
             else:
-                with st.spinner("接続中..."):
+                with st.spinner("銘柄一覧を取得中..."):
                     try:
-                        df, ver = get_listed_info(api_key_input.strip())
+                        # get_listed_info は DataFrame を直接返す（タプルではない）
+                        df = get_listed_info(api_key_input.strip())
                         st.session_state["api_key"] = api_key_input.strip()
                         st.session_state["listed_info"] = df
-                        st.session_state["api_version"] = ver
-                        st.success(f"接続成功！（{len(df):,}銘柄 / API {ver.upper()}）")
+                        st.success(f"接続成功！（{len(df):,}銘柄）")
                         st.rerun()
 
                     except RuntimeError as e:
-                        # ← ここで実際のHTTPエラー内容を全て表示する
                         st.session_state["connect_error"] = str(e)
 
                     except Exception as e:
@@ -98,7 +95,6 @@ with st.sidebar:
                             f"予期しないエラー: {type(e).__name__}: {e}"
                         )
 
-        # 接続エラーを詳細表示
         if st.session_state.get("connect_error"):
             st.error("❌ 接続に失敗しました")
             with st.expander("▶ エラー詳細（クリックで展開）", expanded=True):
@@ -134,14 +130,15 @@ with st.sidebar:
     with c1:
         min_price = st.number_input("株価 最小(円)", min_value=0, value=0, step=100)
     with c2:
-        max_price = st.number_input("株価 最大(円)", min_value=0, value=0, step=100, help="0=上限なし")
+        max_price = st.number_input("株価 最大(円)", min_value=0, value=0, step=100,
+                                    help="0=上限なし")
     c3, c4 = st.columns(2)
     with c3:
         min_cap = st.number_input("時価総額 最小(億円)", min_value=0, value=0, step=10,
-                                   help="※ V2 APIでは株式数データが提供されないため時価総額はN/Aになります")
+                                   help="※V2 APIでは時価総額データがないためフィルター無効")
     with c4:
         max_cap = st.number_input("時価総額 最大(億円)", min_value=0, value=0, step=10,
-                                   help="0=上限なし ※ V2 APIでは時価総額はN/A（フィルター無効）")
+                                   help="0=上限なし ※V2 APIでは無効")
 
     include_per_pbr = st.checkbox("PER・PBRも取得する", value=False,
                                    help="ONにすると各銘柄の財務データを追加取得します")
@@ -189,7 +186,9 @@ if run_btn:
             progress_callback=update_progress,
         )
         st.session_state["screening_result"] = result
-        st.session_state["last_run_params"] = {"timeframe": timeframe, "n_periods": n_periods}
+        st.session_state["last_run_params"] = {
+            "timeframe": timeframe, "n_periods": n_periods,
+        }
         progress_bar.progress(1.0)
         elapsed_text.caption(f"✅ 完了（{time.time() - start_ts:.0f}秒）")
         status_box.update(label="スクリーニング完了！", state="complete")
@@ -213,11 +212,11 @@ if st.session_state["screening_result"] is not None:
 
         disp = result.copy()
         fmt = {
-            "株価(円)":       lambda x: f"{x:,.0f}" if pd.notna(x) else "N/A",
-            "時価総額(億円)":  lambda x: f"{x:,.1f}" if pd.notna(x) else "N/A",
-            "出来高":         lambda x: f"{int(x):,}" if pd.notna(x) and not np.isnan(float(x)) else "N/A",
-            "PER":            lambda x: f"{x:.2f}倍" if pd.notna(x) else "N/A",
-            "PBR":            lambda x: f"{x:.2f}倍" if pd.notna(x) else "N/A",
+            "株価(円)":      lambda x: f"{x:,.0f}" if pd.notna(x) else "N/A",
+            "時価総額(億円)": lambda x: f"{x:,.1f}" if pd.notna(x) else "N/A",
+            "出来高":        lambda x: f"{int(x):,}" if pd.notna(x) and not np.isnan(float(x)) else "N/A",
+            "PER":           lambda x: f"{x:.2f}倍" if pd.notna(x) else "N/A",
+            "PBR":           lambda x: f"{x:.2f}倍" if pd.notna(x) else "N/A",
         }
         for col, fn in fmt.items():
             if col in disp.columns:
@@ -235,7 +234,6 @@ if st.session_state["screening_result"] is not None:
 
 elif not is_logged_in():
     st.info("👈 左のサイドバーからAPIキーを入力して接続してください。")
-
     with st.expander("📖 使い方"):
         st.markdown("""
         1. [J-Quants公式サイト](https://jpx-jquants.com/) で無料登録 → Freeプラン選択
@@ -245,14 +243,4 @@ elif not is_logged_in():
         5. 結果を確認・CSVダウンロード
 
         > ⚠️ 無料プランではデータは約12週間遅延します
-        """)
-
-    with st.expander("⚠️ 旧バージョン（V1）から移行の方へ"):
-        st.markdown("""
-        **「Missing Authentication Token」エラーだった方**
-
-        2025年12月のV2リリースにより、メール/パスワードによるトークン認証が廃止されました。
-        代わりに**APIキー方式**をご利用ください。
-
-        **手順**: [ダッシュボード](https://jpx-jquants.com/dashboard/api-keys) → 設定 → APIキー → 発行
         """)
