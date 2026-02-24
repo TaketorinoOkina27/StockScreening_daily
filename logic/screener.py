@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 FREE_PLAN_DELAY_DAYS = 84   # 無料プランのデータ遅延（12週間）
 TRADING_DAY_BUFFER   = 1.6  # 週末・祝日考慮バッファ
+# 連続上昇n日を判定するには n+1 個のデータが必要。
+# 429などで数日スキップされることを考慮し n+10 日を収集する。
+DAILY_EXTRA_DAYS     = 10
 
 PER_COLS = ["PER", "ForwardPER", "PriceEarningsRatio"]
 PBR_COLS = ["PBR", "PriceBookValueRatio", "PriceToBookRatio"]
@@ -51,9 +54,13 @@ def get_end_date() -> date:
 
 
 def _required_calendar_days(timeframe: str, n_periods: int) -> int:
-    """スクリーニングに必要なカレンダー日数を返す。"""
+    """
+    スクリーニングに必要なカレンダー日数を返す。
+    日足: n_periods + DAILY_EXTRA_DAYS 取引日分のカレンダー日数
+    週足・月足: 対応する取引日数
+    """
     if timeframe == "日足":
-        trading = (n_periods + 10) * TRADING_DAY_BUFFER
+        trading = (n_periods + DAILY_EXTRA_DAYS) * TRADING_DAY_BUFFER
     elif timeframe == "週足":
         trading = (n_periods + 4) * 5 * TRADING_DAY_BUFFER
     else:
@@ -84,44 +91,85 @@ def fetch_price_data(
 ) -> pd.DataFrame:
     """
     スクリーニングに必要な期間分の全銘柄株価を取得する。
-    新しい日から降順にフェッチし、必要な取引日数が揃い次第終了する。
+
+    収集方針:
+      新しい日から降順にフェッチし、実データが返った日だけ counted する。
+      min_trading = n_periods + DAILY_EXTRA_DAYS 取引日分を確保する。
+      429（レートリミット）は 30 秒待機して同じ日を再試行する。
+      非営業日（空200）はスキップして次の日へ進む。
     """
     end_date = get_end_date()
     cal_days = _required_calendar_days(timeframe, n_periods)
     start_date = end_date - timedelta(days=cal_days)
 
     min_trading = {
-        "日足": n_periods + 5,
+        "日足": n_periods + DAILY_EXTRA_DAYS,
         "週足": (n_periods + 3) * 5,
         "月足": (n_periods + 2) * 21,
     }[timeframe]
 
     candidates = _weekday_dates_desc(start_date, end_date)
+    logger.info(
+        f"株価取得開始: {timeframe} n={n_periods}, "
+        f"期間 {start_date}〜{end_date}, "
+        f"必要取引日数={min_trading}, 候補={len(candidates)}日"
+    )
+
     collected = 0
     all_dfs = []
+    i = 0
 
-    for i, d in enumerate(candidates):
+    while i < len(candidates) and collected < min_trading:
+        d = candidates[i]
+
         if progress_callback:
-            progress_callback(i + 1, len(candidates),
-                              f"📥 株価取得中: {d}（取引日 {collected}/{min_trading}）")
+            progress_callback(
+                i + 1, len(candidates),
+                f"📥 株価取得中: {d}（取引日 {collected}/{min_trading}）"
+            )
 
-        df = jq.get_daily_quotes_by_date(api_key, d)
-        if not df.empty:
-            df["_date"] = d
-            all_dfs.append(df)
-            collected += 1
-            if collected >= min_trading:
-                break
+        try:
+            df = jq.get_daily_quotes_by_date(api_key, d)
+            if not df.empty:
+                df["_date"] = d
+                all_dfs.append(df)
+                collected += 1
+            # 空DataFrame = 非営業日 → 次の日へ（i を進める）
+            i += 1
+
+        except RuntimeError as e:
+            # 429: この日のリクエストは失敗。待機後に同じ日を再試行（i は進めない）
+            if "429" in str(e):
+                wait = 30
+                logger.warning(f"429 レートリミット（{d}）。{wait}秒待機後に再試行...")
+                if progress_callback:
+                    progress_callback(
+                        i + 1, len(candidates),
+                        f"⏳ レートリミット中... {wait}秒待機します（{d}）"
+                    )
+                time.sleep(wait)
+                # i を進めないので同じ日を再試行
+            else:
+                # その他エラーはスキップして次へ
+                logger.warning(f"株価取得エラー（{d}）: {str(e)[:80]}")
+                i += 1
 
         time.sleep(jq.REQUEST_INTERVAL)
 
     if not all_dfs:
+        logger.warning("株価データを1日分も取得できませんでした")
         return pd.DataFrame()
+
+    if collected < n_periods + 1:
+        logger.warning(
+            f"収集取引日数 {collected} が不足（最低 {n_periods + 1} 必要）。"
+            f"結果が不正確になる可能性があります。"
+        )
 
     combined = pd.concat(all_dfs, ignore_index=True)
     if "Date" not in combined.columns:
         combined["Date"] = combined["_date"]
-    logger.info(f"株価取得完了: {collected}取引日, {len(combined)}行")
+    logger.info(f"株価取得完了: {collected}取引日, {len(combined):,}行")
     return combined
 
 

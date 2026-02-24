@@ -24,7 +24,7 @@ ENDPOINT_MASTER      = f"{BASE_V2}/equities/master"
 ENDPOINT_BARS_DAILY  = f"{BASE_V2}/equities/bars/daily"
 ENDPOINT_FIN_SUMMARY = f"{BASE_V2}/fins/summary"
 
-REQUEST_INTERVAL     = 0.2
+REQUEST_INTERVAL     = 0.5  # リクエスト間スリープ秒（429対策：0.2→0.5に増加）
 RETRY_WAIT_SEC       = 1.0
 FREE_PLAN_DELAY_DAYS = 84   # Freeプランデータ遅延日数（12週間）
 
@@ -50,6 +50,12 @@ def _get_with_retry(url: str, headers: dict, params: dict,
             body = resp.text[:400]
             last_error = f"HTTP {resp.status_code} — {url}\nレスポンス: {body}"
 
+            if resp.status_code == 429:
+                # レートリミット → 待機してリトライ
+                wait = 10.0 * (attempt + 1)
+                logger.warning(f"429 レートリミット。{wait}秒待機後リトライ...")
+                time.sleep(wait)
+                continue
             if resp.status_code in (400, 401, 403, 404):
                 raise RuntimeError(last_error)
 
@@ -120,8 +126,13 @@ def get_listed_info(api_key: str) -> pd.DataFrame:
 def get_daily_quotes_by_date(api_key: str, date_str: str) -> pd.DataFrame:
     """
     指定日の全銘柄株価を取得する（V2: /v2/equities/bars/daily）。
-    非営業日・エラーは空 DataFrame を返す。
-    V2 主要カラム: Date / Code / O / H / L / C / Vo / AdjC / AdjVo など
+
+    戻り値:
+      - データあり → DataFrame
+      - 非営業日（HTTP 200でデータ空、または404）→ 空 DataFrame
+    例外:
+      - 429（レートリミット）→ RuntimeError を re-raise する。
+        呼び出し元で待機処理を行うこと。
     """
     try:
         return _fetch_all_pages(
@@ -131,7 +142,10 @@ def get_daily_quotes_by_date(api_key: str, date_str: str) -> pd.DataFrame:
             params={"date": date_str},
         )
     except RuntimeError as e:
-        logger.warning(f"株価スキップ ({date_str}): {str(e)[:100]}")
+        if "429" in str(e):
+            raise   # 429は呼び出し元に伝播させて待機処理を委ねる
+        # 非営業日・404など → 空DataFrameで正常扱い
+        logger.info(f"株価スキップ（非営業日等）: {date_str}")
         return pd.DataFrame()
 
 
