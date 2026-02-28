@@ -68,7 +68,7 @@ with st.sidebar:
         api_key_input = st.text_input(
             "APIキー",
             type="password",
-            placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            placeholder="api key",
             key="api_key_input",
         )
         connect_btn = st.button("接続する", use_container_width=True, type="primary")
