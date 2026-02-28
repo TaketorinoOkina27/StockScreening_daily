@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 # ── 定数 ──────────────────────────────────────────────────
 FREE_PLAN_DELAY_DAYS      = 84   # 無料プランのデータ遅延（12週間）
-MAX_LOOKBACK_TRADING_DAYS = 260  # 無限ループ防止上限
 DAYS_PER_WEEK             = 5    # 1週 = 5取引日
 DAYS_PER_MONTH            = 21   # 1ヶ月 = 21取引日
 
@@ -84,7 +83,7 @@ def fetch_price_data(
 
     終了条件:
       (1) collected >= min_trading  → 正常終了
-      (2) counted_lookback >= MAX_LOOKBACK_TRADING_DAYS  → 安全打ち切り（警告ログ）
+      (2) tried_trading >= min_trading + 15  → 安全打ち切り（警告ログ）
 
     429（レートリミット）: 30秒待機して同じ日を再試行する。
     非営業日（空レスポンス）: カウントせず前日へ進む。
@@ -103,9 +102,9 @@ def fetch_price_data(
 
     while collected < min_trading:
         # 安全上限チェック
-        if tried_trading >= MAX_LOOKBACK_TRADING_DAYS:
+        if tried_trading >= min_trading + 15:
             logger.warning(
-                f"安全打ち切り: {MAX_LOOKBACK_TRADING_DAYS}取引日遡ったが "
+                f"安全打ち切り: {tried_trading}取引日遡ったが "
                 f"収集={collected}/{min_trading} 日しか取得できませんでした。"
             )
             break
@@ -140,7 +139,7 @@ def fetch_price_data(
                 if progress_callback:
                     progress_callback(
                         collected, min_trading,
-                        f"⏳ レートリミット中　 {wait}秒待機します"
+                        f"⏳ レートリミット中  {wait}秒待機します"
                     )
                 time.sleep(wait)
                 tried_trading -= 1  # この試行はカウントしない
