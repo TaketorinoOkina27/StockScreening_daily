@@ -18,7 +18,7 @@ FREE_PLAN_DELAY_DAYS = 84   # 無料プランのデータ遅延（12週間）
 TRADING_DAY_BUFFER   = 1.6  # 週末・祝日考慮バッファ
 # 連続上昇n日を判定するには n+1 個のデータが必要。
 # 429などで数日スキップされることを考慮し n+10 日を収集する。
-DAILY_EXTRA_DAYS     = 10
+DAILY_EXTRA_DAYS     = 1
 
 PER_COLS = ["PER", "ForwardPER", "PriceEarningsRatio"]
 PBR_COLS = ["PBR", "PriceBookValueRatio", "PriceToBookRatio"]
